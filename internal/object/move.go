@@ -35,12 +35,32 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 
 	dstFile := findOrCreateDstFile(dstPkg)
 
-	// 2. Identify and isolate the documentation comments attached to the node
+	// 2. OMNIVOROUS COMMENT LOOKUP: Extract comments from any declaration or specification type
 	var docComment *ast.CommentGroup
-	if fDecl, ok := foundObj.Node.(*ast.FuncDecl); ok {
-		docComment = fDecl.Doc
-	} else if gDecl, ok := foundObj.Node.(*ast.GenDecl); ok {
-		docComment = gDecl.Doc
+	switch n := foundObj.Node.(type) {
+	case *ast.FuncDecl:
+		docComment = n.Doc
+	case *ast.GenDecl:
+		docComment = n.Doc
+	case *ast.ValueSpec:
+		docComment = n.Doc
+	case *ast.TypeSpec:
+		docComment = n.Doc
+	}
+
+	// CRITICAL FIX: If it's an inner Spec (like a variable or type row) and has no direct comment,
+	// scan upward to steal the comment from its parent keyword block (common for standalone var declarations)
+	if docComment == nil {
+		if spec, ok := foundObj.Node.(ast.Spec); ok {
+			for _, decl := range foundObj.File.Decls {
+				if gDecl, ok := decl.(*ast.GenDecl); ok && isSpecParent(gDecl, spec) {
+					if gDecl.Doc != nil {
+						docComment = gDecl.Doc
+					}
+					break
+				}
+			}
+		}
 	}
 
 	// 3. TEXT ISOLATION (PART A): Render the moved item cleanly within its native source environment
@@ -51,15 +71,30 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 		}
 	}
 
-	// Create a temporary copy of the declaration to clear inner doc pointers for printing
+	// Create a safe, isolated clone of the declaration to prevent comment duplication during stringification
 	var declToPrint ast.Decl
 	if spec, ok := foundObj.Node.(ast.Spec); ok {
+		var cleanedSpec ast.Spec
+		switch s := spec.(type) {
+		case *ast.ValueSpec:
+			clone := *s
+			clone.Doc = nil
+			clone.Comment = nil
+			cleanedSpec = &clone
+		case *ast.TypeSpec:
+			clone := *s
+			clone.Doc = nil
+			clone.Comment = nil
+			cleanedSpec = &clone
+		default:
+			cleanedSpec = spec
+		}
+
 		declToPrint = &ast.GenDecl{
-			Tok:   getSpecToken(spec),
-			Specs: []ast.Spec{spec},
+			Tok:   getSpecToken(cleanedSpec),
+			Specs: []ast.Spec{cleanedSpec},
 		}
 	} else if decl, ok := foundObj.Node.(ast.Decl); ok {
-		// Deep-copy look-alikes to prevent mutating the tree before stringification
 		if fDecl, ok := decl.(*ast.FuncDecl); ok {
 			clone := *fDecl
 			clone.Doc = nil
@@ -86,7 +121,7 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 		if gDecl, ok := decl.(*ast.GenDecl); ok && isSpecParent(gDecl, foundObj.Node) {
 			removeSpecFromGenDecl(gDecl, foundObj.Node)
 			if len(gDecl.Specs) == 0 {
-				continue
+				continue // Drops the parent keyword block if it's now empty
 			}
 		}
 		updatedDecls = append(updatedDecls, decl)
@@ -112,7 +147,6 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 	// 6. MERGE: Combine the pristine code bases together safely at the pure text layer
 	combinedText := dstBuf.String() + "\n\n" + srcBuf.String()
 
-	// Capture target file path for parsing metadata
 	dstFilePath := dstPkg.Fset.Position(dstFile.Pos()).Filename
 	if dstFilePath == "" {
 		dstFilePath = "grafted_file.go"
