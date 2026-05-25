@@ -10,13 +10,8 @@ import (
 )
 
 // FixCallersAndImports inspects the workspace for usages of the moved object.
-// It guards against self-importing when renaming objects within the same package.
-func FixCallersAndImports(
-	pkgs []*packages.Package,
-	foundObj *object.FoundObject,
-	dstPkgPath string,
-	newName string,
-) (map[*ast.File]*packages.Package, error) {
+// It tracks node ancestors to guarantee method receivers are never incorrectly package-qualified.
+func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject, dstPkgPath string, newName string) (map[*ast.File]*packages.Package, error) {
 	modifiedFiles := make(map[*ast.File]*packages.Package)
 
 	dstPkgName := filepath.Base(dstPkgPath)
@@ -32,39 +27,58 @@ func FixCallersAndImports(
 			continue
 		}
 
-		// Check if this package is the destination package itself
 		isSamePackage := (pkg.PkgPath == dstPkgPath)
 
 		for _, file := range pkg.Syntax {
 			fileWasModified := false
+
+			// Maintain an ordered stack of active parent nodes during traversal
+			var ancestors []ast.Node
 
 			updatedFile := astutil.Apply(file, func(c *astutil.Cursor) bool {
 				node := c.Node()
 				if node == nil {
 					return true
 				}
+				ancestors = append(ancestors, node)
 
-				// Look for identifiers tied to our target object definition
 				if ident, ok := node.(*ast.Ident); ok {
 					if obj, exists := pkg.TypesInfo.Uses[ident]; exists && obj == targetObj {
 
+						// CRITICAL GUARD: Check if this identifier lives inside a method receiver definition
+						isReceiverType := false
+						for i := len(ancestors) - 1; i >= 0; i-- {
+							if fl, ok := ancestors[i].(*ast.FieldList); ok {
+								if i > 0 {
+									// If the parent of this field list is a FuncDecl and matches its Recv field
+									if fd, ok := ancestors[i-1].(*ast.FuncDecl); ok && fd.Recv == fl {
+										isReceiverType = true
+										break
+									}
+								}
+							}
+						}
+
 						if isSamePackage {
-							// SCENARIO A: In-place rename within the same package.
-							// Simply mutate the identifier token name; do NOT qualify it.
+							// Scenario A: Internal package updates
 							ident.Name = finalName
 							fileWasModified = true
 						} else {
-							// SCENARIO B: External package reference adjustment.
+							// Scenario B: External package reference adjustments
+							if isReceiverType {
+								// Method receivers can never be package-qualified.
+								// Skip modifications here so MoveObject can cleanly bundle them.
+								return true
+							}
+
 							parent := c.Parent()
 							if selExpr, isSel := parent.(*ast.SelectorExpr); isSel && selExpr.Sel == ident {
-								// Fix existing external selectors (e.g., oldpkg.Ptr -> compute.NewPtr)
 								selExpr.Sel.Name = finalName
 								if id, ok := selExpr.X.(*ast.Ident); ok {
 									id.Name = dstPkgName
 								}
 								fileWasModified = true
 							} else if !isSel {
-								// Upgrade external bare identifier (like dot-imports) to full selector
 								replacement := &ast.SelectorExpr{
 									X:   ast.NewIdent(dstPkgName),
 									Sel: ast.NewIdent(finalName),
@@ -77,17 +91,19 @@ func FixCallersAndImports(
 				}
 
 				return true
-			}, nil)
+			}, func(c *astutil.Cursor) bool {
+				// Clean up the ancestor tracking stack as we walk back up the syntax tree
+				if c.Node() != nil {
+					ancestors = ancestors[:len(ancestors)-1]
+				}
+				return true
+			})
 
 			if fileWasModified {
 				astFile := updatedFile.(*ast.File)
-
-				// CRITICAL GUARD: Only inject the import statement if the file
-				// is OUTSIDE the target destination package.
 				if !isSamePackage {
 					astutil.AddImport(pkg.Fset, astFile, dstPkgPath)
 				}
-
 				modifiedFiles[astFile] = pkg
 			}
 		}

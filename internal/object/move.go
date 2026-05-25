@@ -19,14 +19,9 @@ type MoveResult struct {
 	DestinationPkg  *packages.Package // Context of the destination package
 }
 
-// MoveObject severs the node and its comments from the source file and grafts it into the destination.
-// If newName is provided (not empty), it renames the declaration seamlessly during the move.
-func MoveObject(
-	pkgs []*packages.Package,
-	foundObj *FoundObject,
-	dstPkgPath string,
-	newName string,
-) (*MoveResult, error) {
+// MoveObject severs the node (and all its associated receiver methods if it's a type)
+// along with its comments from the source file and grafts it into the destination.
+func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath string, newName string) (*MoveResult, error) {
 	// 1. Locate the destination package in the loaded workspace
 	var dstPkg *packages.Package
 	for _, pkg := range pkgs {
@@ -40,9 +35,6 @@ func MoveObject(
 	}
 
 	dstFile := findOrCreateDstFile(dstPkg)
-
-	// CRITICAL FIX: If we are renaming in-place within the same package,
-	// force the destination file target to be the exact same source file.
 	if foundObj.Pkg.PkgPath == dstPkgPath {
 		dstFile = foundObj.File
 	}
@@ -60,7 +52,6 @@ func MoveObject(
 		oldName = n.Name.Name
 	case *ast.ValueSpec:
 		docComment = n.Doc
-		// Target the first name as a fallback for oldName resolution
 		if len(n.Names) > 0 {
 			oldName = n.Names[0].Name
 		}
@@ -68,7 +59,6 @@ func MoveObject(
 		docComment = n.Doc
 	}
 
-	// Scan upward for parent comments if moving a spec row without direct documentation
 	if docComment == nil {
 		if spec, ok := foundObj.Node.(ast.Spec); ok {
 			for _, decl := range foundObj.File.Decls {
@@ -77,6 +67,33 @@ func MoveObject(
 						docComment = gDecl.Doc
 					}
 					break
+				}
+			}
+		}
+	}
+
+	// 2.5. COMPANION METHOD SCANNING: If the node is a TypeSpec, aggregate its methods
+	var companionMethods []*ast.FuncDecl
+	companionMethodsMap := make(map[ast.Decl]bool)
+
+	var targetTypeName string
+	if tSpec, ok := foundObj.Node.(*ast.TypeSpec); ok {
+		targetTypeName = tSpec.Name.Name
+	} else if gDecl, ok := foundObj.Node.(*ast.GenDecl); ok && gDecl.Tok == token.TYPE {
+		if len(gDecl.Specs) > 0 {
+			if tSpec, ok := gDecl.Specs[0].(*ast.TypeSpec); ok {
+				targetTypeName = tSpec.Name.Name
+			}
+		}
+	}
+
+	// If we successfully resolved a target struct type name, sweep for its companion methods
+	if targetTypeName != "" {
+		for _, decl := range foundObj.File.Decls {
+			if funcDecl, ok := decl.(*ast.FuncDecl); ok && funcDecl.Recv != nil {
+				if getReceiverTypeName(funcDecl.Recv) == targetTypeName {
+					companionMethods = append(companionMethods, funcDecl)
+					companionMethodsMap[funcDecl] = true
 				}
 			}
 		}
@@ -91,16 +108,89 @@ func MoveObject(
 	}
 
 	// Create a safe, isolated clone of the declaration and apply the rename interceptor
-	declToPrint := cloneDeclaration(foundObj, oldName, newName)
+	var declToPrint ast.Decl
+	if spec, ok := foundObj.Node.(ast.Spec); ok {
+		var cleanedSpec ast.Spec
+		switch s := spec.(type) {
+		case *ast.ValueSpec:
+			clone := *s
+			clone.Doc = nil
+			clone.Comment = nil
+			if newName != "" {
+				newNames := make([]*ast.Ident, len(s.Names))
+				for i, ident := range s.Names {
+					idClone := *ident
+					if ident.Name == oldName || len(s.Names) == 1 {
+						idClone.Name = newName
+					}
+					newNames[i] = &idClone
+				}
+				clone.Names = newNames
+			}
+			cleanedSpec = &clone
+
+		case *ast.TypeSpec:
+			clone := *s
+			clone.Doc = nil
+			clone.Comment = nil
+			if newName != "" {
+				idClone := *s.Name
+				idClone.Name = newName
+				clone.Name = &idClone
+			}
+			cleanedSpec = &clone
+
+		default:
+			cleanedSpec = spec
+		}
+
+		declToPrint = &ast.GenDecl{
+			Tok:   getSpecToken(cleanedSpec),
+			Specs: []ast.Spec{cleanedSpec},
+		}
+	} else if decl, ok := foundObj.Node.(ast.Decl); ok {
+		if fDecl, ok := decl.(*ast.FuncDecl); ok {
+			clone := *fDecl
+			clone.Doc = nil
+			if newName != "" {
+				idClone := *fDecl.Name
+				idClone.Name = newName
+				clone.Name = &idClone
+			}
+			declToPrint = &clone
+		} else if gDecl, ok := decl.(*ast.GenDecl); ok {
+			clone := *gDecl
+			clone.Doc = nil
+			declToPrint = &clone
+		} else {
+			declToPrint = decl
+		}
+	}
 
 	if err := format.Node(&srcBuf, foundObj.Pkg.Fset, declToPrint); err != nil {
 		return nil, fmt.Errorf("failed to stringify source node: %w", err)
 	}
+	srcBuf.WriteString("\n\n")
 
-	// 4. SEVER: Remove the declaration and comments completely from the source file
+	// Append all gathered companion methods to the text isolation sequence stream
+	for _, method := range companionMethods {
+		if method.Doc != nil {
+			for _, c := range method.Doc.List {
+				srcBuf.WriteString(c.Text + "\n")
+			}
+		}
+		methodClone := *method
+		methodClone.Doc = nil // Prevent double comments from printing
+		if err := format.Node(&srcBuf, foundObj.Pkg.Fset, &methodClone); err != nil {
+			return nil, fmt.Errorf("failed to stringify companion method %s: %w", method.Name.Name, err)
+		}
+		srcBuf.WriteString("\n\n")
+	}
+
+	// 4. SEVER: Remove the declaration, all companion methods, and comments from the source file
 	var updatedDecls []ast.Decl
 	for _, decl := range foundObj.File.Decls {
-		if decl == foundObj.Node {
+		if decl == foundObj.Node || companionMethodsMap[decl] {
 			continue
 		}
 		if gDecl, ok := decl.(*ast.GenDecl); ok && isSpecParent(gDecl, foundObj.Node) {
@@ -113,15 +203,24 @@ func MoveObject(
 	}
 	foundObj.File.Decls = updatedDecls
 
+	// Track all comment groups that must be dropped from the file cache
+	commentsToRemove := make(map[*ast.CommentGroup]bool)
 	if docComment != nil {
-		var updatedComments []*ast.CommentGroup
-		for _, cg := range foundObj.File.Comments {
-			if cg != docComment {
-				updatedComments = append(updatedComments, cg)
-			}
-		}
-		foundObj.File.Comments = updatedComments
+		commentsToRemove[docComment] = true
 	}
+	for _, m := range companionMethods {
+		if m.Doc != nil {
+			commentsToRemove[m.Doc] = true
+		}
+	}
+
+	var updatedComments []*ast.CommentGroup
+	for _, cg := range foundObj.File.Comments {
+		if !commentsToRemove[cg] {
+			updatedComments = append(updatedComments, cg)
+		}
+	}
+	foundObj.File.Comments = updatedComments
 
 	// 5. TEXT ISOLATION (PART B): Render the untouched destination file into a clean string
 	var dstBuf bytes.Buffer
@@ -158,6 +257,70 @@ func MoveObject(
 	}, nil
 }
 
+// getReceiverTypeName extracts the raw type identifier string from a method receiver.
+// It seamlessly peels back pointer stars, generic constraints, and index lists.
+func getReceiverTypeName(recv *ast.FieldList) string {
+	if recv == nil || len(recv.List) == 0 {
+		return ""
+	}
+
+	t := recv.List[0].Type
+
+	// Peel off pointer wrappers: *Type -> Type
+	if star, ok := t.(*ast.StarExpr); ok {
+		t = star.X
+	}
+
+	// Peel off single generic type index identifiers: Type[T] -> Type
+	if idx, ok := t.(*ast.IndexExpr); ok {
+		t = idx.X
+	}
+
+	// Peel off multiple generic type index identifier lists: Type[T, K] -> Type
+	if idxList, ok := t.(*ast.IndexListExpr); ok {
+		t = idxList.X
+	}
+
+	if ident, ok := t.(*ast.Ident); ok {
+		return ident.Name
+	}
+
+	return ""
+}
+
+// Internal standard layout parsing helpers
+func isSpecParent(gDecl *ast.GenDecl, target ast.Node) bool {
+	for _, spec := range gDecl.Specs {
+		if spec == target {
+			return true
+		}
+	}
+	return false
+}
+
+func removeSpecFromGenDecl(gDecl *ast.GenDecl, target ast.Node) {
+	var remaining []ast.Spec
+	for _, spec := range gDecl.Specs {
+		if spec != target {
+			remaining = append(remaining, spec)
+		}
+	}
+	gDecl.Specs = remaining
+}
+
+func getSpecToken(spec ast.Spec) token.Token {
+	switch spec.(type) {
+	case *ast.ImportSpec:
+		return token.IMPORT
+	case *ast.TypeSpec:
+		return token.TYPE
+	case *ast.ValueSpec:
+		return token.VAR
+	default:
+		return token.ILLEGAL
+	}
+}
+
 // Helper: Finds "packagename.go" or initializes an empty AST file if the package is empty
 func findOrCreateDstFile(dstPkg *packages.Package) *ast.File {
 	for _, file := range dstPkg.Syntax {
@@ -175,111 +338,4 @@ func findOrCreateDstFile(dstPkg *packages.Package) *ast.File {
 	}
 	dstPkg.Syntax = append(dstPkg.Syntax, newFile)
 	return newFile
-}
-
-// Helper: Checks if a GenDecl block (like var (...)) contains our target Spec node
-func isSpecParent(gDecl *ast.GenDecl, target ast.Node) bool {
-	spec, ok := target.(ast.Spec)
-	if !ok {
-		return false
-	}
-	for _, s := range gDecl.Specs {
-		if s == spec {
-			return true
-		}
-	}
-	return false
-}
-
-// Helper: Modifies a multi-declaration block to extract a single spec
-func removeSpecFromGenDecl(gDecl *ast.GenDecl, target ast.Node) {
-	var updatedSpecs []ast.Spec
-	for _, s := range gDecl.Specs {
-		if s != target {
-			updatedSpecs = append(updatedSpecs, s)
-		}
-	}
-	gDecl.Specs = updatedSpecs
-}
-
-// Helper: Determines the token type (VAR, CONST, TYPE) for a standalone Spec wrapper
-func getSpecToken(spec ast.Spec) token.Token {
-	switch spec.(type) {
-	case *ast.TypeSpec:
-		return token.TYPE
-	case *ast.ValueSpec:
-		return token.VAR
-	default:
-		return token.VAR
-	}
-}
-
-// Helper: Create a safe, isolated clone of the declaration and apply the rename interceptor
-func cloneDeclaration(foundObj *FoundObject, oldName, newName string) ast.Decl {
-	var declToPrint ast.Decl
-	if spec, ok := foundObj.Node.(ast.Spec); ok {
-		var cleanedSpec ast.Spec
-		switch s := spec.(type) {
-		case *ast.ValueSpec:
-			clone := *s
-			clone.Doc = nil
-			clone.Comment = nil
-
-			// RENAME INTERCEPTOR: Update the specific matching variable identifier name
-			if newName != "" {
-				newNames := make([]*ast.Ident, len(s.Names))
-				for i, ident := range s.Names {
-					idClone := *ident
-					if ident.Name == oldName || len(s.Names) == 1 {
-						idClone.Name = newName
-					}
-					newNames[i] = &idClone
-				}
-				clone.Names = newNames
-			}
-			cleanedSpec = &clone
-
-		case *ast.TypeSpec:
-			clone := *s
-			clone.Doc = nil
-			clone.Comment = nil
-
-			// RENAME INTERCEPTOR: Update type definition identifier name
-			if newName != "" {
-				idClone := *s.Name
-				idClone.Name = newName
-				clone.Name = &idClone
-			}
-			cleanedSpec = &clone
-
-		default:
-			cleanedSpec = spec
-		}
-
-		declToPrint = &ast.GenDecl{
-			Tok:   getSpecToken(cleanedSpec),
-			Specs: []ast.Spec{cleanedSpec},
-		}
-	} else if decl, ok := foundObj.Node.(ast.Decl); ok {
-		if fDecl, ok := decl.(*ast.FuncDecl); ok {
-			clone := *fDecl
-			clone.Doc = nil
-
-			// RENAME INTERCEPTOR: Update function/method name
-			if newName != "" {
-				idClone := *fDecl.Name
-				idClone.Name = newName
-				clone.Name = &idClone
-			}
-			declToPrint = &clone
-		} else if gDecl, ok := decl.(*ast.GenDecl); ok {
-			clone := *gDecl
-			clone.Doc = nil
-			declToPrint = &clone
-		} else {
-			declToPrint = decl
-		}
-	}
-
-	return declToPrint
 }
