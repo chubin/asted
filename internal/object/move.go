@@ -41,6 +41,12 @@ func MoveObject(
 
 	dstFile := findOrCreateDstFile(dstPkg)
 
+	// CRITICAL FIX: If we are renaming in-place within the same package,
+	// force the destination file target to be the exact same source file.
+	if foundObj.Pkg.PkgPath == dstPkgPath {
+		dstFile = foundObj.File
+	}
+
 	// 2. OMNIVOROUS COMMENT LOOKUP: Extract comments and identify the old identifier name
 	var docComment *ast.CommentGroup
 	var oldName string
