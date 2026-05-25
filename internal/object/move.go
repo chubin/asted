@@ -20,7 +20,8 @@ type MoveResult struct {
 }
 
 // MoveObject severs the node and its comments from the source file and grafts it into the destination.
-func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath string) (*MoveResult, error) {
+// If newName is provided (not empty), it renames the declaration seamlessly during the move.
+func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath string, newName string) (*MoveResult, error) {
 	// 1. Locate the destination package in the loaded workspace
 	var dstPkg *packages.Package
 	for _, pkg := range pkgs {
@@ -35,21 +36,28 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 
 	dstFile := findOrCreateDstFile(dstPkg)
 
-	// 2. OMNIVOROUS COMMENT LOOKUP: Extract comments from any declaration or specification type
+	// 2. OMNIVOROUS COMMENT LOOKUP: Extract comments and identify the old identifier name
 	var docComment *ast.CommentGroup
+	var oldName string
+
 	switch n := foundObj.Node.(type) {
 	case *ast.FuncDecl:
 		docComment = n.Doc
-	case *ast.GenDecl:
+		oldName = n.Name.Name
+	case *ast.TypeSpec:
 		docComment = n.Doc
+		oldName = n.Name.Name
 	case *ast.ValueSpec:
 		docComment = n.Doc
-	case *ast.TypeSpec:
+		// Target the first name as a fallback for oldName resolution
+		if len(n.Names) > 0 {
+			oldName = n.Names[0].Name
+		}
+	case *ast.GenDecl:
 		docComment = n.Doc
 	}
 
-	// CRITICAL FIX: If it's an inner Spec (like a variable or type row) and has no direct comment,
-	// scan upward to steal the comment from its parent keyword block (common for standalone var declarations)
+	// Scan upward for parent comments if moving a spec row without direct documentation
 	if docComment == nil {
 		if spec, ok := foundObj.Node.(ast.Spec); ok {
 			for _, decl := range foundObj.File.Decls {
@@ -71,7 +79,7 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 		}
 	}
 
-	// Create a safe, isolated clone of the declaration to prevent comment duplication during stringification
+	// Create a safe, isolated clone of the declaration and apply the rename interceptor
 	var declToPrint ast.Decl
 	if spec, ok := foundObj.Node.(ast.Spec); ok {
 		var cleanedSpec ast.Spec
@@ -80,12 +88,34 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 			clone := *s
 			clone.Doc = nil
 			clone.Comment = nil
+
+			// RENAME INTERCEPTOR: Update the specific matching variable identifier name
+			if newName != "" {
+				newNames := make([]*ast.Ident, len(s.Names))
+				for i, ident := range s.Names {
+					idClone := *ident
+					if ident.Name == oldName || len(s.Names) == 1 {
+						idClone.Name = newName
+					}
+					newNames[i] = &idClone
+				}
+				clone.Names = newNames
+			}
 			cleanedSpec = &clone
+
 		case *ast.TypeSpec:
 			clone := *s
 			clone.Doc = nil
 			clone.Comment = nil
+
+			// RENAME INTERCEPTOR: Update type definition identifier name
+			if newName != "" {
+				idClone := *s.Name
+				idClone.Name = newName
+				clone.Name = &idClone
+			}
 			cleanedSpec = &clone
+
 		default:
 			cleanedSpec = spec
 		}
@@ -98,6 +128,13 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 		if fDecl, ok := decl.(*ast.FuncDecl); ok {
 			clone := *fDecl
 			clone.Doc = nil
+
+			// RENAME INTERCEPTOR: Update function/method name
+			if newName != "" {
+				idClone := *fDecl.Name
+				idClone.Name = newName
+				clone.Name = &idClone
+			}
 			declToPrint = &clone
 		} else if gDecl, ok := decl.(*ast.GenDecl); ok {
 			clone := *gDecl
@@ -121,7 +158,7 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 		if gDecl, ok := decl.(*ast.GenDecl); ok && isSpecParent(gDecl, foundObj.Node) {
 			removeSpecFromGenDecl(gDecl, foundObj.Node)
 			if len(gDecl.Specs) == 0 {
-				continue // Drops the parent keyword block if it's now empty
+				continue
 			}
 		}
 		updatedDecls = append(updatedDecls, decl)

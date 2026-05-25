@@ -2,106 +2,102 @@ package codebase
 
 import (
 	"go/ast"
+	"path/filepath"
 
 	"github.com/welibekov/asted/internal/object"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 )
 
-// FixCallersAndImports updates all references to the moved object and updates package imports.
-// It returns a map of all files that were modified during this process.
+// FixCallersAndImports inspects the entire workspace for usages of the moved object.
+// It updates their package qualifiers, applies the optional newName, and injects missing imports.
 func FixCallersAndImports(
 	pkgs []*packages.Package,
 	foundObj *object.FoundObject,
 	dstPkgPath string,
-	dstPkgName string,
+	newName string,
 ) (map[*ast.File]*packages.Package, error) {
-
 	modifiedFiles := make(map[*ast.File]*packages.Package)
+
+	// Determine the target name (fallback to original name if newName is empty)
+	finalName := newName
+	if finalName == "" {
+		finalName = foundObj.Object.Name()
+	}
+
+	// Derive the clean short package name of the destination (e.g., "compute" from "internal/compute")
+	dstPkgName := filepath.Base(dstPkgPath)
+
+	// We use the type-checker's unique object pointer to find exact references across the workspace
 	targetObj := foundObj.Object
 
 	for _, pkg := range pkgs {
-		// FIX 1: Shifted to an index loop so we can overwrite package syntax pointers
-		for idx, file := range pkg.Syntax {
+		if pkg.TypesInfo == nil {
+			continue
+		}
+
+		for _, file := range pkg.Syntax {
 			fileWasModified := false
 
+			// astutil.Apply allows us to cleanly mutate or replace AST nodes during a depth-first traversal
 			updatedFile := astutil.Apply(file, func(c *astutil.Cursor) bool {
 				node := c.Node()
 				if node == nil {
 					return true
 				}
 
-				switch n := node.(type) {
-				// Scenario A: Caller is in an external package (e.g., pkgA.MyFunction)
-				case *ast.SelectorExpr:
-					if obj := pkg.TypesInfo.Uses[n.Sel]; obj == targetObj {
-						if pkg.PkgPath == dstPkgPath {
-							c.Replace(n.Sel)
-						} else {
-							n.X = ast.NewIdent(dstPkgName)
+				// SCENARIO 1: Handle existing qualified references (e.g., oldpkg.OldName)
+				if selExpr, ok := node.(*ast.SelectorExpr); ok {
+					// Check if the selection identifier matches our target object
+					if obj, exists := pkg.TypesInfo.Uses[selExpr.Sel]; exists && obj == targetObj {
+
+						// 1. Rewrite the selector name to the new name
+						selExpr.Sel.Name = finalName
+
+						// 2. Rewrite the package qualifier prefix to the new package name
+						if id, ok := selExpr.X.(*ast.Ident); ok {
+							id.Name = dstPkgName
 						}
+
 						fileWasModified = true
+						return false // Stop traversing down this specific sub-tree
 					}
+				}
 
-				// Scenario B: Caller is in the original package (e.g., direct call to MyFunction)
-				case *ast.Ident:
-					if obj := pkg.TypesInfo.Uses[n]; obj == targetObj {
+				// SCENARIO 2: Handle bare internal references (e.g., OldName used inside the source package)
+				if ident, ok := node.(*ast.Ident); ok {
+					// Ensure we are matching the target object definition or usage
+					if obj, exists := pkg.TypesInfo.Uses[ident]; exists && obj == targetObj {
 
-						// =================================================================
-						// >>> CRITICAL FIX: CHILD-SELECTOR GUARD <<<
-						if _, isParentSelector := c.Parent().(*ast.SelectorExpr); isParentSelector {
-							return true
-						}
-						// =================================================================
+						// Ensure this identifier isn't already the child of a SelectorExpr we handled above
+						parent := c.Parent()
+						if _, isSel := parent.(*ast.SelectorExpr); !isSel {
 
-						// FIX 2: Upgraded from a simple FuncDecl check to a Comprehensive Definition Guard.
-						// This ensures functions, types, variables, and constants are all protected.
-						isDefinition := false
-						switch parent := c.Parent().(type) {
-						case *ast.FuncDecl:
-							if parent.Name == n {
-								isDefinition = true
+							// Transform the bare identifier into a full qualified selector expression
+							replacement := &ast.SelectorExpr{
+								X:   ast.NewIdent(dstPkgName),
+								Sel: ast.NewIdent(finalName),
 							}
-						case *ast.TypeSpec:
-							if parent.Name == n {
-								isDefinition = true
-							}
-						case *ast.ValueSpec:
-							for _, nameIdent := range parent.Names {
-								if nameIdent == n {
-									isDefinition = true
-									break
-								}
-							}
-						}
 
-						// If it is an actual usage/caller (not a definition), apply the prefix
-						if !isDefinition {
-							if pkg.PkgPath != dstPkgPath {
-								newSelector := &ast.SelectorExpr{
-									X:   ast.NewIdent(dstPkgName),
-									Sel: n,
-								}
-								c.Replace(newSelector)
-								fileWasModified = true
-							}
+							c.Replace(replacement)
+							fileWasModified = true
 						}
 					}
 				}
+
 				return true
 			}, nil)
 
+			// If any references were updated in this file, manage package imports
 			if fileWasModified {
 				astFile := updatedFile.(*ast.File)
 
-				// FIX 3: Keep the workspace syntax tree perfectly synchronized in memory
-				pkg.Syntax[idx] = astFile
+				// Add the new package import path to the top of the file
+				astutil.AddImport(pkg.Fset, astFile, dstPkgPath)
 
-				if pkg.PkgPath != dstPkgPath {
-					astutil.AddImport(pkg.Fset, astFile, dstPkgPath)
-				}
+				// If we are modifying files inside the original source package,
+				// goimports will automatically clean up the old unused import statement later.
 
-				astutil.DeleteImport(pkg.Fset, astFile, foundObj.Pkg.PkgPath)
 				modifiedFiles[astFile] = pkg
 			}
 		}
