@@ -42,6 +42,7 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 	// 2. OMNIVOROUS COMMENT LOOKUP: Extract comments and identify the old identifier name
 	var docComment *ast.CommentGroup
 	var oldName string
+	var parentTok token.Token = token.VAR // Default fallbac
 
 	switch n := foundObj.Node.(type) {
 	case *ast.FuncDecl:
@@ -57,12 +58,14 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 		}
 	case *ast.GenDecl:
 		docComment = n.Doc
+		parentTok = n.Tok // Capture token directly if the node is the GenDecl wrapper
 	}
 
 	if docComment == nil {
 		if spec, ok := foundObj.Node.(ast.Spec); ok {
 			for _, decl := range foundObj.File.Decls {
 				if gDecl, ok := decl.(*ast.GenDecl); ok && isSpecParent(gDecl, spec) {
+					parentTok = gDecl.Tok // CRITICAL FIX: Capture token.CONST or token.VAR safely!
 					if gDecl.Doc != nil {
 						docComment = gDecl.Doc
 					}
@@ -145,7 +148,7 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 		}
 
 		declToPrint = &ast.GenDecl{
-			Tok:   getSpecToken(cleanedSpec),
+			Tok:   parentTok,
 			Specs: []ast.Spec{cleanedSpec},
 		}
 	} else if decl, ok := foundObj.Node.(ast.Decl); ok {
@@ -306,19 +309,6 @@ func removeSpecFromGenDecl(gDecl *ast.GenDecl, target ast.Node) {
 		}
 	}
 	gDecl.Specs = remaining
-}
-
-func getSpecToken(spec ast.Spec) token.Token {
-	switch spec.(type) {
-	case *ast.ImportSpec:
-		return token.IMPORT
-	case *ast.TypeSpec:
-		return token.TYPE
-	case *ast.ValueSpec:
-		return token.VAR
-	default:
-		return token.ILLEGAL
-	}
 }
 
 // Helper: Finds "packagename.go" or initializes an empty AST file if the package is empty
