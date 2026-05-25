@@ -16,7 +16,9 @@ func LoadPackages(baseDir string) ([]*packages.Package, error) {
 			packages.NeedSyntax |
 			packages.NeedTypes |
 			packages.NeedTypesInfo |
-			packages.NeedImports,
+			packages.NeedImports |
+			packages.NeedCompiledGoFiles |
+			packages.NeedModule,
 	}
 
 	// Loading "./..." inside the baseDir context ensures every sub-package in that project is analyzed
