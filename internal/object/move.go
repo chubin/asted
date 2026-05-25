@@ -21,7 +21,12 @@ type MoveResult struct {
 
 // MoveObject severs the node and its comments from the source file and grafts it into the destination.
 // If newName is provided (not empty), it renames the declaration seamlessly during the move.
-func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath string, newName string) (*MoveResult, error) {
+func MoveObject(
+	pkgs []*packages.Package,
+	foundObj *FoundObject,
+	dstPkgPath string,
+	newName string,
+) (*MoveResult, error) {
 	// 1. Locate the destination package in the loaded workspace
 	var dstPkg *packages.Package
 	for _, pkg := range pkgs {
@@ -80,70 +85,7 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 	}
 
 	// Create a safe, isolated clone of the declaration and apply the rename interceptor
-	var declToPrint ast.Decl
-	if spec, ok := foundObj.Node.(ast.Spec); ok {
-		var cleanedSpec ast.Spec
-		switch s := spec.(type) {
-		case *ast.ValueSpec:
-			clone := *s
-			clone.Doc = nil
-			clone.Comment = nil
-
-			// RENAME INTERCEPTOR: Update the specific matching variable identifier name
-			if newName != "" {
-				newNames := make([]*ast.Ident, len(s.Names))
-				for i, ident := range s.Names {
-					idClone := *ident
-					if ident.Name == oldName || len(s.Names) == 1 {
-						idClone.Name = newName
-					}
-					newNames[i] = &idClone
-				}
-				clone.Names = newNames
-			}
-			cleanedSpec = &clone
-
-		case *ast.TypeSpec:
-			clone := *s
-			clone.Doc = nil
-			clone.Comment = nil
-
-			// RENAME INTERCEPTOR: Update type definition identifier name
-			if newName != "" {
-				idClone := *s.Name
-				idClone.Name = newName
-				clone.Name = &idClone
-			}
-			cleanedSpec = &clone
-
-		default:
-			cleanedSpec = spec
-		}
-
-		declToPrint = &ast.GenDecl{
-			Tok:   getSpecToken(cleanedSpec),
-			Specs: []ast.Spec{cleanedSpec},
-		}
-	} else if decl, ok := foundObj.Node.(ast.Decl); ok {
-		if fDecl, ok := decl.(*ast.FuncDecl); ok {
-			clone := *fDecl
-			clone.Doc = nil
-
-			// RENAME INTERCEPTOR: Update function/method name
-			if newName != "" {
-				idClone := *fDecl.Name
-				idClone.Name = newName
-				clone.Name = &idClone
-			}
-			declToPrint = &clone
-		} else if gDecl, ok := decl.(*ast.GenDecl); ok {
-			clone := *gDecl
-			clone.Doc = nil
-			declToPrint = &clone
-		} else {
-			declToPrint = decl
-		}
-	}
+	declToPrint := cloneDeclaration(foundObj, oldName, newName)
 
 	if err := format.Node(&srcBuf, foundObj.Pkg.Fset, declToPrint); err != nil {
 		return nil, fmt.Errorf("failed to stringify source node: %w", err)
@@ -264,4 +206,74 @@ func getSpecToken(spec ast.Spec) token.Token {
 	default:
 		return token.VAR
 	}
+}
+
+// Helper: Create a safe, isolated clone of the declaration and apply the rename interceptor
+func cloneDeclaration(foundObj *FoundObject, oldName, newName string) ast.Decl {
+	var declToPrint ast.Decl
+	if spec, ok := foundObj.Node.(ast.Spec); ok {
+		var cleanedSpec ast.Spec
+		switch s := spec.(type) {
+		case *ast.ValueSpec:
+			clone := *s
+			clone.Doc = nil
+			clone.Comment = nil
+
+			// RENAME INTERCEPTOR: Update the specific matching variable identifier name
+			if newName != "" {
+				newNames := make([]*ast.Ident, len(s.Names))
+				for i, ident := range s.Names {
+					idClone := *ident
+					if ident.Name == oldName || len(s.Names) == 1 {
+						idClone.Name = newName
+					}
+					newNames[i] = &idClone
+				}
+				clone.Names = newNames
+			}
+			cleanedSpec = &clone
+
+		case *ast.TypeSpec:
+			clone := *s
+			clone.Doc = nil
+			clone.Comment = nil
+
+			// RENAME INTERCEPTOR: Update type definition identifier name
+			if newName != "" {
+				idClone := *s.Name
+				idClone.Name = newName
+				clone.Name = &idClone
+			}
+			cleanedSpec = &clone
+
+		default:
+			cleanedSpec = spec
+		}
+
+		declToPrint = &ast.GenDecl{
+			Tok:   getSpecToken(cleanedSpec),
+			Specs: []ast.Spec{cleanedSpec},
+		}
+	} else if decl, ok := foundObj.Node.(ast.Decl); ok {
+		if fDecl, ok := decl.(*ast.FuncDecl); ok {
+			clone := *fDecl
+			clone.Doc = nil
+
+			// RENAME INTERCEPTOR: Update function/method name
+			if newName != "" {
+				idClone := *fDecl.Name
+				idClone.Name = newName
+				clone.Name = &idClone
+			}
+			declToPrint = &clone
+		} else if gDecl, ok := decl.(*ast.GenDecl); ok {
+			clone := *gDecl
+			clone.Doc = nil
+			declToPrint = &clone
+		} else {
+			declToPrint = decl
+		}
+	}
+
+	return declToPrint
 }
