@@ -98,6 +98,29 @@ func executeMove(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("input spec parsing failure: %w", err)
 	}
 
+	// =========================================================================
+	// ROUTE INTERCEPTOR FOR INTERFACE & METHOD LEVEL TRANSFORMS
+	// =========================================================================
+	if spec.IsMethod {
+		cmd.Printf("[+] Analyzing contract graph and resolving implementations for method %s...\n", spec.SourceMethod)
+
+		modifiedFiles, err := codebase.FixMethodRenames(pkgs, spec)
+		if err != nil {
+			return fmt.Errorf("method refactoring execution failure: %w", err)
+		}
+
+		cmd.Printf("[+] Flushing optimized modifications securely to disk storage...\n")
+		if err := codebase.SaveModifiedFiles(modifiedFiles); err != nil {
+			return fmt.Errorf("failed to flush refactored files back to storage: %w", err)
+		}
+
+		cmd.Printf("[✓] Successfully refactored method %s into %s across all implementations!\n", spec.SourceMethod, spec.DestMethod)
+		return nil
+	}
+
+	// =========================================================================
+	// STANDARD PIPELINE FOR GLOBAL SYMBOLS (FUNCTIONS, VARIABLES, TYPES)
+	// =========================================================================
 	// 5. Locate the targeted symbol in the loaded workspace map
 	foundObject, err := object.FindObject(pkgs, spec.SourcePkgPath, spec.SourceDecl)
 	if err != nil {

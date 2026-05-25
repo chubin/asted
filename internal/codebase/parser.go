@@ -7,52 +7,72 @@ import (
 
 // RefactorSpec holds the completely sanitized, fully-qualified execution blueprints
 type RefactorSpec struct {
-	SourcePkgPath string
-	SourceDecl    string
-	DestPkgPath   string
-	DestDecl      string // Will be identical to SourceDecl if no rename is requested
-	NewName       string // Explicit new name for the object, empty string if no rename
+	SourcePkgPath  string
+	SourceTypeName string
+	SourceMethod   string
+	DestPkgPath    string
+	DestTypeName   string
+	DestMethod     string
+	NewName        string
+	IsMethod       bool
+	SourceDecl     string // Fallback field for standard declarations
+	DestDecl       string // Fallback field for standard declarations
 }
 
 // ParseRefactorSpec handles the layout translation from raw CLI input arguments.
-// It resolves module naming automatically and falls back to matching declaration identities.
 func ParseRefactorSpec(srcInput, dstInput, modulePath string) (*RefactorSpec, error) {
-	// 1. Isolate paths and declaration names for both targets
-	srcPkg, srcDecl := splitPkgAndDecl(srcInput)
-	dstPkg, dstDecl := splitPkgAndDecl(dstInput)
+	srcPkg, srcType, srcMethod := splitPkgTypeMethod(srcInput)
+	dstPkg, dstType, dstMethod := splitPkgTypeMethod(dstInput)
 
-	if srcDecl == "" {
-		return nil, fmt.Errorf("source input %q must explicitly specify a declaration name (e.g., package.Name)", srcInput)
-	}
-
-	// Rule 3: If no destination declaration name is provided, assume it matches the source
-	var newName string
-	if dstDecl == "" {
-		dstDecl = srcDecl
-		newName = "" // No rename transformation occurring
-	} else if dstDecl != srcDecl {
-		newName = dstDecl // Explicit rename requested
-	}
-
-	// Rule 2: Automatically prepend the module path to local targets if missing
 	srcPkg = ensureFullyQualified(srcPkg, modulePath)
 	dstPkg = ensureFullyQualified(dstPkg, modulePath)
 
+	// Detect if we are processing a method-level operation
+	if srcType != "" && srcMethod != "" {
+		if dstMethod == "" {
+			dstMethod = srcMethod
+		}
+		return &RefactorSpec{
+			SourcePkgPath:  srcPkg,
+			SourceTypeName: srcType,
+			SourceMethod:   srcMethod,
+			DestPkgPath:    dstPkg,
+			DestTypeName:   dstType,
+			DestMethod:     dstMethod,
+			NewName:        dstMethod,
+			IsMethod:       true,
+		}, nil
+	}
+
+	// Fallback to standard declaration parsing rules
+	if srcType == "" {
+		return nil, fmt.Errorf("source input %q must explicitly specify a declaration name", srcInput)
+	}
+
+	dstDecl := dstType
+	if dstDecl == "" {
+		dstDecl = srcType
+	}
+
+	var newName string
+	if dstDecl != srcType {
+		newName = dstDecl
+	}
+
 	return &RefactorSpec{
 		SourcePkgPath: srcPkg,
-		SourceDecl:    srcDecl,
+		SourceDecl:    srcType,
 		DestPkgPath:   dstPkg,
 		DestDecl:      dstDecl,
 		NewName:       newName,
+		IsMethod:      false,
 	}, nil
 }
 
-// splitPkgAndDecl safely separates a package path from its target declaration token.
-// It guards against package paths containing domain-level dots (e.g., github.com/foo/bar.Method)
-func splitPkgAndDecl(input string) (string, string) {
+// splitPkgTypeMethod safely separates package paths from type boundaries and method tokens.
+// It explicitly guards against domain-level dots in path strings (e.g., github.com/user/repo)
+func splitPkgTypeMethod(input string) (string, string, string) {
 	input = strings.TrimSuffix(input, ".")
-
-	// Find the final forward slash to isolate the base package directory name
 	lastSlash := strings.LastIndex(input, "/")
 
 	base := input
@@ -62,31 +82,34 @@ func splitPkgAndDecl(input string) (string, string) {
 		base = input[lastSlash+1:]
 	}
 
-	// Scan exclusively the base filename block for a declaration dot separator
-	lastDot := strings.LastIndex(base, ".")
-	if lastDot == -1 {
-		return input, "" // No declaration block present
+	dots := strings.Count(base, ".")
+	if dots >= 2 {
+		// Method Format identified: pkg.TypeName.MethodName
+		firstDot := strings.Index(base, ".")
+		lastDot := strings.LastIndex(base, ".")
+
+		pkgName := base[:firstDot]
+		typeName := base[firstDot+1 : lastDot]
+		methodName := base[lastDot+1:]
+
+		return prefix + pkgName, typeName, methodName
+	} else if dots == 1 {
+		// Standard Format identified: pkg.DeclarationName
+		lastDot := strings.LastIndex(base, ".")
+		return prefix + base[:lastDot], base[lastDot+1:], ""
 	}
 
-	pkgPath := prefix + base[:lastDot]
-	declName := base[lastDot+1:]
-	return pkgPath, declName
+	return input, "", ""
 }
 
-// ensureFullyQualified binds un-prefixed local folders to the active module context.
 func ensureFullyQualified(pkgPath, modulePath string) string {
 	if modulePath == "" {
 		return pkgPath
 	}
-
 	pkgPath = strings.Trim(pkgPath, "/")
 	modulePath = strings.Trim(modulePath, "/")
-
-	// If the path already has the module path or looks like an absolute external domain, keep it
 	if strings.HasPrefix(pkgPath, modulePath) || strings.Contains(strings.Split(pkgPath, "/")[0], ".") {
 		return pkgPath
 	}
-
-	// Automatically prepend the module prefix name to local sub-paths
 	return modulePath + "/" + pkgPath
 }
