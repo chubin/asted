@@ -16,3 +16,20 @@ asted mv [source-package.Declaration] [destination-package.[NewName]]
 
 # Example: Move Ptr from util to compute, updating all workspace reference callers
 asted mv internal/auth/util.Ptr internal/compute
+```
+
+## Feature Highlight
+
+asted's core is an engine engineered to bypass traditional string-replacement and unstable memory syntax-tree manipulation barriers.
+
+**Isomorphic Declaration Moving**: Move code by referencing the paths you already write every day (e.g., `pkg/path.ObjectName`).
+
+**Companion Method Bundling**: Go structurally decouples structs and methods. asted automatically scans, severs, and migrates all companion methods matching value, pointer, or complex generic receivers (like `Struct[T, K]`) alongside the parent type declaration.
+
+**Implicit Satisfaction Analysis**: Powered by `go/types`, the engine sweeps the workspace to resolve hidden interface bounds, safely applying method renames to abstract contracts and structural structs at the same time.
+
+**Paradox & Loop Protection**: Detects local in-package renames to safely omit package qualifiers and intercept destructive circular dependency loops.
+
+**Token Duality Retention**: Navigates the AST `ValueSpec` duality natively. Constants remain `const` and variables remain `var` throughout the extraction sequence.
+
+**Performant & Cache-Safe**: Utilizes process-level directory shifting (`os.Chdir`) to safely run alongside Go's native compilation caching engines without tree corruption.
