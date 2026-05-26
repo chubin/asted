@@ -33,3 +33,28 @@ asted's core is an engine engineered to bypass traditional string-replacement an
 **Token Duality Retention**: Navigates the AST `ValueSpec` duality natively. Constants remain `const` and variables remain `var` throughout the extraction sequence.
 
 **Performant & Cache-Safe**: Utilizes process-level directory shifting (`os.Chdir`) to safely run alongside Go's native compilation caching engines without tree corruption.
+
+## Installation
+
+`asted` can be installed natively using standard Go toolchains:
+
+```bash
+go install [github.com/welibekov/asted@latest](https://github.com/welibekov/asted@latest)
+```
+
+## Command Line Arguments
+
+```bash
+Usage:
+  asted mv [source-declaration] [destination-target] [flags]
+
+Examples:
+  asted mv internal/auth/util.Ptr internal/compute
+  asted mv internal/auth/util.Ptr internal/compute.NewPtr
+  asted mv internal/types.User.GetName internal/types.User.GetFullName --dir ./app
+
+Flags:
+  -d, --dir string   Path to the target project workspace directory (default ".")
+  -h, --help         help for mv
+```
+
