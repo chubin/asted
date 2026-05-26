@@ -39,7 +39,7 @@ asted's core is an engine engineered to bypass traditional string-replacement an
 `asted` can be installed natively using standard Go toolchains:
 
 ```bash
-go install [github.com/welibekov/asted@latest](https://github.com/welibekov/asted@latest)
+go install https://github.com/welibekov/asted@latest
 ```
 
 ## Command Line Arguments
