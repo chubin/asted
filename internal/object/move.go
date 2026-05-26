@@ -42,7 +42,7 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 	// 2. OMNIVOROUS COMMENT LOOKUP: Extract comments and identify the old identifier name
 	var docComment *ast.CommentGroup
 	var oldName string
-	var parentTok token.Token = token.VAR // Default fallbac
+	var parentTok token.Token = token.VAR // Default fallback
 
 	switch n := foundObj.Node.(type) {
 	case *ast.FuncDecl:
