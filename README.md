@@ -1,10 +1,12 @@
-# asted
+## asted
 
 **asted** is a lightning-fast, compilation-safe CLI tool for code structural migration, package-boundary refactoring, and global declaration rewriting in Go.
 
 ## Introduction
 
 Think of it as your old friend `sed`, but matching and transforming abstract syntax tree (AST) structures instead of flat file blocks. You can re-route, rename, and relocate functions, types, variables, or interfaces without ever fracturing your module graphs or breaking cross-package imports.
+
+![asted demo](assets/asted.svg)
 
 ## Quick Start
 
