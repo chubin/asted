@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings" // Added for filename sanitization
 
 	"github.com/spf13/cobra"
 	"github.com/welibekov/asted/internal/codebase"
@@ -13,7 +14,8 @@ import (
 
 // Global commands
 var (
-	projectDir string // Global variable to store the flag's target string
+	projectDir   string // Global variable to store the flag's target string
+	filenameFlag string // Added to store the target filename flag value
 
 	rootCmd = &cobra.Command{
 		Use:   "asted",
@@ -29,7 +31,8 @@ grafts it into the destination package, and automatically repairs all call sites
 
 Examples:
   asted mv internal/auth/util.Ptr internal/compute
-  asted mv internal/auth/util.Ptr internal/compute.NewPtr`,
+  asted mv internal/auth/util.Ptr internal/compute.NewPtr
+  asted mv internal/auth/util.Ptr internal/compute --filename=engine.go`,
 		// Enforce that exactly 2 positional arguments must be provided
 		Args: cobra.ExactArgs(2),
 		// RunE allows us to return standard errors gracefully back to Cobra's layout printer
@@ -39,8 +42,10 @@ Examples:
 
 func init() {
 	// Register the --dir / -d flag persistently across all application subcommands.
-	// Setting the default value to "." satisfies assuming the current working directory.
 	rootCmd.PersistentFlags().StringVarP(&projectDir, "dir", "d", ".", "Path to the target project workspace directory")
+
+	// Register the --filename / -f flag specifically to the 'mv' subcommand.
+	mvCmd.Flags().StringVarP(&filenameFlag, "filename", "f", "", "Target file name for the moved declaration (e.g., engine.go)")
 
 	// Register subcommands under the master application root
 	rootCmd.AddCommand(mvCmd)
@@ -56,6 +61,11 @@ func main() {
 func executeMove(cmd *cobra.Command, args []string) error {
 	rawSrcInput := args[0] // e.g., "internal/auth/util.Ptr"
 	rawDstInput := args[1] // e.g., "internal/compute.NewPtr"
+
+	// SANITIZATION: If user passed '--filename=engine', automatically normalize it to 'engine.go'
+	if filenameFlag != "" && !strings.HasSuffix(filenameFlag, ".go") {
+		filenameFlag += ".go"
+	}
 
 	// 1. ATOMIC ENVIRONMENT SHIFT: Resolve and drop directly into the target directory context
 	absProjectDir, err := filepath.Abs(projectDir)
@@ -89,7 +99,7 @@ func executeMove(cmd *cobra.Command, args []string) error {
 	}
 
 	if modulePath == "" {
-		fmt.Errorf("No module path is found")
+		return fmt.Errorf("no module path is found") // Fixed a small syntax bug here: added return
 	}
 
 	// 4. Parse and sanitize the inputs using our smart specification parser
@@ -138,7 +148,7 @@ func executeMove(cmd *cobra.Command, args []string) error {
 	cmd.Printf("[+] Severing object from source and grafting into destination...\n")
 
 	// 7. Memory AST extraction and re-parsing
-	moveResult, err := object.MoveObject(pkgs, foundObject, spec.DestPkgPath, spec.NewName)
+	moveResult, err := object.MoveObject(pkgs, foundObject, spec.DestPkgPath, spec.NewName, filenameFlag)
 	if err != nil {
 		return fmt.Errorf("failed to process syntax tree transfer: %w", err)
 	}

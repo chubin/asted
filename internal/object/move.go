@@ -21,7 +21,7 @@ type MoveResult struct {
 
 // MoveObject severs the node (and all its associated receiver methods if it's a type)
 // along with its comments from the source file and grafts it into the destination.
-func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath string, newName string) (*MoveResult, error) {
+func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath string, newName string, targetFilename string) (*MoveResult, error) {
 	// 1. Locate the destination package in the loaded workspace
 	var dstPkg *packages.Package
 	for _, pkg := range pkgs {
@@ -34,8 +34,9 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 		return nil, fmt.Errorf("destination package %s not found in workspace", dstPkgPath)
 	}
 
-	dstFile := findOrCreateDstFile(dstPkg)
-	if foundObj.Pkg.PkgPath == dstPkgPath {
+	// Route to the explicit filename target if provided; otherwise follow fallback defaults
+	dstFile := findOrCreateDstFile(dstPkg, targetFilename)
+	if foundObj.Pkg.PkgPath == dstPkgPath && targetFilename == "" {
 		dstFile = foundObj.File
 	}
 
@@ -236,7 +237,25 @@ func MoveObject(pkgs []*packages.Package, foundObj *FoundObject, dstPkgPath stri
 
 	dstFilePath := dstPkg.Fset.Position(dstFile.Pos()).Filename
 	if dstFilePath == "" {
-		dstFilePath = "grafted_file.go"
+		// If dealing with a newly synthesized empty file structure, resolve the physical directory step context
+		var dir string
+		for _, f := range dstPkg.Syntax {
+			if p := dstPkg.Fset.Position(f.Pos()).Filename; p != "" {
+				dir = filepath.Dir(p)
+				break
+			}
+		}
+
+		expectedName := dstPkg.Name + ".go"
+		if targetFilename != "" {
+			expectedName = targetFilename
+		}
+
+		if dir != "" {
+			dstFilePath = filepath.Join(dir, expectedName)
+		} else {
+			dstFilePath = expectedName
+		}
 	}
 
 	// 7. RE-PARSE: Parse the text stream into a fresh, perfectly indexed destination syntax tree
@@ -311,18 +330,25 @@ func removeSpecFromGenDecl(gDecl *ast.GenDecl, target ast.Node) {
 	gDecl.Specs = remaining
 }
 
-// Helper: Finds "packagename.go" or initializes an empty AST file if the package is empty
-func findOrCreateDstFile(dstPkg *packages.Package) *ast.File {
+// Helper: Finds targeted file name, default "packagename.go", or initializes an empty AST file if needed
+func findOrCreateDstFile(dstPkg *packages.Package, targetFilename string) *ast.File {
+	expectedName := dstPkg.Name + ".go"
+	if targetFilename != "" {
+		expectedName = targetFilename
+	}
+
 	for _, file := range dstPkg.Syntax {
-		if filepath.Base(dstPkg.Fset.Position(file.Pos()).Filename) == dstPkg.Name+".go" {
+		if filepath.Base(dstPkg.Fset.Position(file.Pos()).Filename) == expectedName {
 			return file
 		}
 	}
-	if len(dstPkg.Syntax) > 0 {
+
+	// Only allow generalized fallbacks to the first index if an explicit file path match wasn't requested
+	if targetFilename == "" && len(dstPkg.Syntax) > 0 {
 		return dstPkg.Syntax[0]
 	}
 
-	// Fallback: Create a synthetic file layout if no files exist
+	// Fallback: Create a synthetic file layout if no files match the target signature criteria
 	newFile := &ast.File{
 		Name: ast.NewIdent(dstPkg.Name),
 	}

@@ -7,6 +7,7 @@ import (
 	"go/format"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/imports"
@@ -24,8 +25,20 @@ func SaveModifiedFiles(modifiedFiles map[*ast.File]*packages.Package) error {
 		filePath := pkg.Fset.Position(file.Pos()).Filename
 
 		if filePath == "" || filepath.Base(filePath) == "grafted_file.go" || !filepath.IsAbs(filePath) {
+			var pkgDir string
+
 			if len(pkg.GoFiles) > 0 {
-				pkgDir := filepath.Dir(pkg.GoFiles[0])
+				// Strategy A: Derive directory from existing package files
+				pkgDir = filepath.Dir(pkg.GoFiles[0])
+			} else if pkg.Module != nil {
+				// Strategy B: Fallback for empty/new packages using module coordinates
+				// e.g., converts "github.com/org/repo/internal/compute" -> "internal/compute"
+				relSubPath := strings.TrimPrefix(pkg.PkgPath, pkg.Module.Path)
+				relSubPath = strings.TrimPrefix(relSubPath, "/")
+				pkgDir = filepath.Join(pkg.Module.Dir, relSubPath)
+			}
+
+			if pkgDir != "" {
 				baseName := filepath.Base(filePath)
 				if baseName == "" || baseName == "." || baseName == "grafted_file.go" {
 					baseName = file.Name.Name + ".go"
@@ -37,6 +50,12 @@ func SaveModifiedFiles(modifiedFiles map[*ast.File]*packages.Package) error {
 		absPath, err := filepath.Abs(filePath)
 		if err != nil {
 			return fmt.Errorf("failed to resolve absolute path for %s: %w", filePath, err)
+		}
+
+		// CRITICAL SAFETY: Ensure the physical directory path exists on disk before attempting to write.
+		// This guarantees that if a new or custom file path was chosen, the directories are initialized on the fly.
+		if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+			return fmt.Errorf("failed to create directory structure for %s: %w", absPath, err)
 		}
 
 		if sampleAbsPath == "" {
@@ -103,7 +122,6 @@ func SaveModifiedFiles(modifiedFiles map[*ast.File]*packages.Package) error {
 	}
 
 	// PASS 2: Run imports.Process ONLY on the exact files we changed.
-	// Since we are physically inside the module directory, local paths resolve perfectly!
 	for absPath := range pathToLatestFile {
 		content, err := os.ReadFile(absPath)
 		if err != nil {
