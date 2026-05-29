@@ -10,8 +10,13 @@ import (
 )
 
 // FixCallersAndImports inspects the workspace for usages of the moved object.
-// It tracks node ancestors to guarantee method receivers are never incorrectly package-qualified.
-func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject, dstPkgPath string, newName string) (map[*ast.File]*packages.Package, error) {
+// It uses contextual state tracking to guarantee method receivers are never incorrectly package-qualified.
+func FixCallersAndImports(
+	pkgs []*packages.Package,
+	foundObj *object.FoundObject,
+	dstPkgPath string,
+	newName string,
+) (map[*ast.File]*packages.Package, error) {
 	modifiedFiles := make(map[*ast.File]*packages.Package)
 
 	dstPkgName := filepath.Base(dstPkgPath)
@@ -24,7 +29,7 @@ func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject
 
 	for _, pkg := range pkgs {
 		if pkg.TypesInfo == nil {
-			continue
+			continue // Defensive guard against un-typechecked packages
 		}
 
 		isSamePackage := (pkg.PkgPath == dstPkgPath)
@@ -32,58 +37,58 @@ func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject
 		for _, file := range pkg.Syntax {
 			fileWasModified := false
 
-			// Maintain an ordered stack of active parent nodes during traversal
-			var ancestors []ast.Node
+			// Contextual State Flag replacing the old manual slice stack
+			var inReceiver bool
 
 			updatedFile := astutil.Apply(file, func(c *astutil.Cursor) bool {
 				node := c.Node()
 				if node == nil {
 					return true
 				}
-				ancestors = append(ancestors, node)
 
+				// 1. TRACK ENTRY: Detect if we are stepping into a method receiver list
+				if fl, ok := node.(*ast.FieldList); ok {
+					if fd, ok := c.Parent().(*ast.FuncDecl); ok && fd.Recv == fl {
+						inReceiver = true
+					}
+				}
+
+				// 2. IDENTIFIER EVALUATION
 				if ident, ok := node.(*ast.Ident); ok {
 					if obj, exists := pkg.TypesInfo.Uses[ident]; exists && obj == targetObj {
 
-						// CRITICAL GUARD: Check if this identifier lives inside a method receiver definition
-						isReceiverType := false
-						for i := len(ancestors) - 1; i >= 0; i-- {
-							if fl, ok := ancestors[i].(*ast.FieldList); ok {
-								if i > 0 {
-									// If the parent of this field list is a FuncDecl and matches its Recv field
-									if fd, ok := ancestors[i-1].(*ast.FuncDecl); ok && fd.Recv == fl {
-										isReceiverType = true
-										break
-									}
-								}
-							}
-						}
-
 						if isSamePackage {
-							// Scenario A: Internal package updates
+							// Scenario A: Internal package updates (In-place mutation)
 							ident.Name = finalName
 							fileWasModified = true
 						} else {
 							// Scenario B: External package reference adjustments
-							if isReceiverType {
-								// Method receivers can never be package-qualified.
-								// Skip modifications here so MoveObject can cleanly bundle them.
+							if inReceiver {
+								// Method receivers can never be package-qualified. Skip.
 								return true
 							}
 
 							parent := c.Parent()
 							if selExpr, isSel := parent.(*ast.SelectorExpr); isSel && selExpr.Sel == ident {
+								// Already qualified expression (e.g., oldpkg.MyStruct -> newpkg.YourStruct)
 								selExpr.Sel.Name = finalName
 								if id, ok := selExpr.X.(*ast.Ident); ok {
 									id.Name = dstPkgName
 								}
 								fileWasModified = true
 							} else if !isSel {
-								replacement := &ast.SelectorExpr{
-									X:   ast.NewIdent(dstPkgName),
-									Sel: ast.NewIdent(finalName),
-								}
-								c.Replace(replacement)
+								// Unqualified naked identifier -> Convert to SelectorExpr (e.g., MyStruct -> newpkg.YourStruct)
+								newX := ast.NewIdent(dstPkgName)
+								newSel := ast.NewIdent(finalName)
+
+								// POSITION TRAP FIX: Transfer position tokens to protect code formatting
+								newX.NamePos = ident.NamePos
+								newSel.NamePos = ident.NamePos
+
+								c.Replace(&ast.SelectorExpr{
+									X:   newX,
+									Sel: newSel,
+								})
 								fileWasModified = true
 							}
 						}
@@ -92,13 +97,16 @@ func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject
 
 				return true
 			}, func(c *astutil.Cursor) bool {
-				// Clean up the ancestor tracking stack as we walk back up the syntax tree
-				if c.Node() != nil {
-					ancestors = ancestors[:len(ancestors)-1]
+				// 3. TRACK EXIT: Turn off the flag as we walk back up past the receiver list
+				if fl, ok := c.Node().(*ast.FieldList); ok {
+					if fd, ok := c.Parent().(*ast.FuncDecl); ok && fd.Recv == fl {
+						inReceiver = false
+					}
 				}
 				return true
 			})
 
+			// 4. POST-WALK IMPORT ADJUSTMENTS
 			if fileWasModified {
 				astFile := updatedFile.(*ast.File)
 				if !isSamePackage {
