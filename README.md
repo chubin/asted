@@ -20,6 +20,14 @@ asted mv [source-package.Declaration] [destination-package.[NewName]]
 asted mv internal/auth/util.Ptr internal/compute
 ```
 
+## Screenshots
+
+### Moving a Struct and its Methods
+![asted screenshot 01](assets/screenshots/screenshot_01.png)
+![asted screenshot 02](assets/screenshots/screenshot_02.png)
+![asted screenshot 03](assets/screenshots/screenshot_03.png)
+![asted screenshot 03](assets/screenshots/screenshot_04.png)
+
 ## Installation
 
 `asted` can be installed natively using standard Go toolchains:
