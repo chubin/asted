@@ -2,7 +2,9 @@ package codebase
 
 import (
 	"go/ast"
+	"go/types"
 	"path/filepath"
+	"strings"
 
 	"github.com/welibekov/asted/internal/object"
 	"golang.org/x/tools/go/ast/astutil"
@@ -10,11 +12,18 @@ import (
 )
 
 // FixCallersAndImports inspects the workspace for usages of the moved object.
-// It tracks node ancestors to guarantee method receivers are never incorrectly package-qualified.
-func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject, dstPkgPath string, newName string) (map[*ast.File]*packages.Package, error) {
+// It uses contextual state tracking to guarantee method receivers are never incorrectly package-qualified,
+// automatically resolves package namespace collisions using smart overrides, and cleans up dead imports.
+func FixCallersAndImports(
+	pkgs []*packages.Package,
+	foundObj *object.FoundObject,
+	dstPkgPath string,
+	newName string,
+) (map[*ast.File]*packages.Package, error) {
 	modifiedFiles := make(map[*ast.File]*packages.Package)
 
-	dstPkgName := filepath.Base(dstPkgPath)
+	srcPkgPath := foundObj.Pkg.PkgPath
+	dstDefaultName := filepath.Base(dstPkgPath) // e.g., "types"
 	finalName := newName
 	if finalName == "" {
 		finalName = foundObj.Object.Name()
@@ -24,7 +33,7 @@ func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject
 
 	for _, pkg := range pkgs {
 		if pkg.TypesInfo == nil {
-			continue
+			continue // Defensive guard against un-typechecked packages
 		}
 
 		isSamePackage := (pkg.PkgPath == dstPkgPath)
@@ -32,58 +41,84 @@ func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject
 		for _, file := range pkg.Syntax {
 			fileWasModified := false
 
-			// Maintain an ordered stack of active parent nodes during traversal
-			var ancestors []ast.Node
+			// Step 1: Pre-flight check to ensure this file actually references our target object
+			usesTargetObj := false
+			for _, obj := range pkg.TypesInfo.Uses {
+				if obj == targetObj {
+					usesTargetObj = true
+					break
+				}
+			}
+			if !usesTargetObj {
+				continue
+			}
+
+			// Step 2: Determine if an import namespace conflict will occur in this file
+			var localPkgAlias string
+			if !isSamePackage {
+				collision, existingImportPath := inspectImportCollision(file, dstPkgPath, dstDefaultName)
+				if collision && existingImportPath != dstPkgPath {
+					// Namespace is occupied by a different package (e.g., auth/types vs compute/types).
+					// Calculate a clean, deterministic prefix like "computetypes".
+					localPkgAlias = generateSmartAlias(dstPkgPath)
+				} else {
+					// No namespace collision detected. Use standard base qualifier.
+					localPkgAlias = dstDefaultName
+				}
+			}
+
+			// Contextual State Flag replacing the old manual slice stack
+			var inReceiver bool
 
 			updatedFile := astutil.Apply(file, func(c *astutil.Cursor) bool {
 				node := c.Node()
 				if node == nil {
 					return true
 				}
-				ancestors = append(ancestors, node)
 
+				// 1. TRACK ENTRY: Detect if we are stepping into a method receiver list
+				if fl, ok := node.(*ast.FieldList); ok {
+					if fd, ok := c.Parent().(*ast.FuncDecl); ok && fd.Recv == fl {
+						inReceiver = true
+					}
+				}
+
+				// 2. IDENTIFIER EVALUATION
 				if ident, ok := node.(*ast.Ident); ok {
 					if obj, exists := pkg.TypesInfo.Uses[ident]; exists && obj == targetObj {
 
-						// CRITICAL GUARD: Check if this identifier lives inside a method receiver definition
-						isReceiverType := false
-						for i := len(ancestors) - 1; i >= 0; i-- {
-							if fl, ok := ancestors[i].(*ast.FieldList); ok {
-								if i > 0 {
-									// If the parent of this field list is a FuncDecl and matches its Recv field
-									if fd, ok := ancestors[i-1].(*ast.FuncDecl); ok && fd.Recv == fl {
-										isReceiverType = true
-										break
-									}
-								}
-							}
-						}
-
 						if isSamePackage {
-							// Scenario A: Internal package updates
+							// Scenario A: Internal package updates (In-place mutation)
 							ident.Name = finalName
 							fileWasModified = true
 						} else {
 							// Scenario B: External package reference adjustments
-							if isReceiverType {
-								// Method receivers can never be package-qualified.
-								// Skip modifications here so MoveObject can cleanly bundle them.
+							if inReceiver {
+								// Method receivers can never be package-qualified. Skip.
 								return true
 							}
 
 							parent := c.Parent()
 							if selExpr, isSel := parent.(*ast.SelectorExpr); isSel && selExpr.Sel == ident {
+								// Already qualified expression (e.g., oldpkg.MyStruct -> computetypes.YourStruct)
 								selExpr.Sel.Name = finalName
 								if id, ok := selExpr.X.(*ast.Ident); ok {
-									id.Name = dstPkgName
+									id.Name = localPkgAlias
 								}
 								fileWasModified = true
 							} else if !isSel {
-								replacement := &ast.SelectorExpr{
-									X:   ast.NewIdent(dstPkgName),
-									Sel: ast.NewIdent(finalName),
-								}
-								c.Replace(replacement)
+								// Unqualified naked identifier -> Convert to SelectorExpr
+								newX := ast.NewIdent(localPkgAlias)
+								newSel := ast.NewIdent(finalName)
+
+								// POSITION TRAP FIX: Transfer position tokens to protect code formatting
+								newX.NamePos = ident.NamePos
+								newSel.NamePos = ident.NamePos
+
+								c.Replace(&ast.SelectorExpr{
+									X:   newX,
+									Sel: newSel,
+								})
 								fileWasModified = true
 							}
 						}
@@ -92,17 +127,30 @@ func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject
 
 				return true
 			}, func(c *astutil.Cursor) bool {
-				// Clean up the ancestor tracking stack as we walk back up the syntax tree
-				if c.Node() != nil {
-					ancestors = ancestors[:len(ancestors)-1]
+				// 3. TRACK EXIT: Turn off the flag as we walk back up past the receiver list
+				if fl, ok := c.Node().(*ast.FieldList); ok {
+					if fd, ok := c.Parent().(*ast.FuncDecl); ok && fd.Recv == fl {
+						inReceiver = false
+					}
 				}
 				return true
 			})
 
+			// 4. POST-WALK IMPORT ADJUSTMENTS WITH COLLISION SAFETY & GARBAGE COLLECTION
 			if fileWasModified {
 				astFile := updatedFile.(*ast.File)
 				if !isSamePackage {
-					astutil.AddImport(pkg.Fset, astFile, dstPkgPath)
+					// Inject the import with an alias override if a collision occurred
+					if localPkgAlias != dstDefaultName {
+						astutil.AddNamedImport(pkg.Fset, astFile, localPkgAlias, dstPkgPath)
+					} else {
+						astutil.AddImport(pkg.Fset, astFile, dstPkgPath)
+					}
+
+					// Garbage collect the old source package import if no remaining identifiers need it
+					if !isOldImportStillNeeded(astFile, pkg.TypesInfo, targetObj, srcPkgPath) {
+						astutil.DeleteImport(pkg.Fset, astFile, srcPkgPath)
+					}
 				}
 				modifiedFiles[astFile] = pkg
 			}
@@ -110,4 +158,70 @@ func FixCallersAndImports(pkgs []*packages.Package, foundObj *object.FoundObject
 	}
 
 	return modifiedFiles, nil
+}
+
+// inspectImportCollision scans current file imports to identify package naming conflicts.
+func inspectImportCollision(file *ast.File, newPkgPath, baseName string) (bool, string) {
+	for _, imp := range file.Imports {
+		pathValue := strings.Trim(imp.Path.Value, `"`)
+
+		// If an existing explicit named alias matches our base name target
+		if imp.Name != nil {
+			if imp.Name.Name == baseName {
+				return true, pathValue
+			}
+			continue
+		}
+
+		// If an un-aliased basic import target matches our base name path element
+		if filepath.Base(pathValue) == baseName {
+			return true, pathValue
+		}
+	}
+	return false, ""
+}
+
+// generateSmartAlias builds a descriptive naming alias combining domain steps.
+// (e.g., "internal/compute/types" -> "computetypes", "auth" -> "authpkg")
+func generateSmartAlias(pkgPath string) string {
+	// Clean up any trailing/leading slashes and split
+	cleaned := strings.Trim(pkgPath, "/")
+	if cleaned == "" {
+		return "aliasedpkg"
+	}
+
+	parts := strings.Split(cleaned, "/")
+	if len(parts) >= 2 {
+		// e.g., internal/compute/types -> "compute" + "types" = "computetypes"
+		return parts[len(parts)-2] + parts[len(parts)-1]
+	}
+
+	// Fallback for single-element paths (e.g., "auth" -> "authpkg")
+	return parts[0] + "pkg"
+}
+
+// isOldImportStillNeeded verifies if any remaining expressions depend on the abandoned package statement.
+func isOldImportStillNeeded(file *ast.File, info *types.Info, targetObj types.Object, srcPkgPath string) bool {
+	stillNeeded := false
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		ident, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+
+		obj, exists := info.Uses[ident]
+		if !exists || obj == targetObj {
+			return true
+		}
+
+		// If another element points to an active object belonging to our old package, preserve the import boundary
+		if obj.Pkg() != nil && obj.Pkg().Path() == srcPkgPath {
+			stillNeeded = true
+			return false // Stop traversal early
+		}
+		return true
+	})
+
+	return stillNeeded
 }
