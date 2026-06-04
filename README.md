@@ -102,3 +102,58 @@ At its core, asted is built to bypass blind text find-and-replace, leveraging Go
 
 * Automatic Interface Tracking: Renaming an interface method usually breaks compilation across your project. asted analyzes your workspace type graph to find every struct that implicitly implements that interface, updating the interface contracts, concrete implementations, and call sites simultaneously.
 
+## AI and CI
+
+Normal AI changes can produce huge diffs that are hard to understand.
+
+In many cases, such large changes can be made using simple AST modification
+scripts. Thus, instead of reviewing thousands of lines of code, it is
+enough to (1) review the AST modification script and (2) ensure that the PR does not
+contain any other changes.
+If the script is correct, the result is correct too.
+
+> Normal PR: "Here’s 8,000 lines of changes. Trust me."
+>
+> **asted** + CI: "Here’s a small script. CI proved that running this script on the old code produces exactly these changes."
+
+The goal of **asted**’s CI integration is simple:
+**Make sure every code change in a pull request was produced by the **asted** script — and nothing else.**
+
+This removes the need to manually review thousands of changed files.
+Instead, CI automatically verifies that the changes are reproducible from the script.
+
+How it works (step by step):
+
+1. Developer creates an **asted** script
+   - They use AI (or write it manually) to generate a small **asted** script that describes the desired change (e.g. move a package, rename something, apply a pattern, etc.).
+   - The script is saved in the repository (usually in a dedicated place like `.asted/`).
+
+2. Developer applies the script locally
+   - Run the script on their code.
+   - This produces the actual code changes.
+
+3. Open a Pull Request
+   - The PR contains:
+     - The code changes
+     - The **asted** script that was used to generate those changes
+
+4. CI runs an automatic verification check
+   This is the key part. The CI does the following:
+
+   - Takes the *base commit* (the commit the PR is based on)
+   - Applies the ***asted** script* from the PR to that base commit
+   - Compares the result with the actual code in the PR
+
+   Possible outcomes:
+
+   | Result                        | Meaning                                      | CI Status |
+   |-------------------------------|----------------------------------------------|---------|
+   | Output matches the PR exactly | All changes came from the script             | ✅ Pass |
+   | Output is different           | Script is non-deterministic or was modified  | ❌ Fail |
+   | Extra changes exist           | Someone manually edited files                | ❌ Fail |
+   | Missing changes               | Script was not fully applied                 | ❌ Fail |
+
+5. Review process
+   - Reviewers mainly review the ***asted** script* itself (which is small and understandable).
+   - They don’t need to deeply review every changed file, because CI has already proven that the diff was generated deterministically from the script.
+
