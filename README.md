@@ -20,6 +20,46 @@ asted mv [source-package.Declaration] [destination-package.[NewName]]
 asted mv internal/auth/util.Ptr internal/compute
 ```
 
+## Where asted shines
+
+***asted*** works best when you need to make big, repetitive changes across many
+files — without turning the pull request into a nightmare to review.
+
+**Table 1. Structural and Organizational Refactorings**  
+*(the strongest area for **asted**)*
+
+| Task                       | Example                                          | Why it fits **asted** well                                                                         |
+|----------------------------|--------------------------------------------------|------------------------------------------------------------------------------------------------|
+| Moving packages or modules | Move `internal/auth` → `pkg/auth`                | One **asted** script updates the folder structure and fixes all imports across the codebase        |
+| Mass renaming              | Rename package `user` → `account` everywhere     | The script defines the renaming rule once and automatically updates all references and imports |
+| Folder reorganization      | Move all domain models into a separate directory | A clear, repeatable rule for transforming file paths and package declarations                  |
+| Module extraction          | Extract client logic into its own package        | The script precisely describes what code should be moved and where it should go                |
+
+This category is where ***asted*** delivers the highest leverage: one small, reviewable script can safely reorganize large parts of the project.
+
+Here are several other typical usage patterns where it really helps:
+
+### 1. Moving and renaming things at scale
+
+You want to reorganize packages, move files, or rename a module everywhere.
+Instead of manually updating hundreds of imports and references, you describe the change once. **asted** turns it into a clear, repeatable script.
+
+### 2. Changing APIs and updating all call sites
+
+You add, remove, or rename a parameter. Or you change how a function should be called.
+**asted** can generate a script that updates every place that uses it — consistently and safely.
+
+### 3. Applying the same pattern everywhere
+
+You decide to add logging, error handling, validation, or a new wrapper to many functions.
+You don’t do it by hand. You create one small script that applies the pattern the same way in every file.
+
+
+**In short:**
+
+***asted*** shines when the change is mechanical and repetitive.
+You stop editing code by hand at scale and start writing small, reliable instructions instead.
+
 ## Screenshots
 
 ### Moving a Struct and its Methods
